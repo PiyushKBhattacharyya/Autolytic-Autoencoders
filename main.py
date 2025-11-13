@@ -111,8 +111,12 @@ while meta_iter < max_meta_iters:
             z, _ = temp_encoder(data[:16])
             gen_samples = temp_decoder(z, temp_encoder(data[:16])[1])
 
-        initial_metrics = eval_metrics.evaluate([real_samples.cpu().numpy()], [real_samples.cpu().numpy()])  # Baseline
-        final_metrics = eval_metrics.evaluate([real_samples.cpu().numpy()], [gen_samples.cpu().numpy()])
+        # Convert to numpy arrays properly for evaluation
+        real_np = [img.permute(1, 2, 0).cpu().numpy() for img in real_samples]
+        gen_np = [img.permute(1, 2, 0).cpu().numpy() for img in gen_samples]
+
+        initial_metrics = eval_metrics.evaluate(real_np, real_np)  # Baseline
+        final_metrics = eval_metrics.evaluate(real_np, gen_np)
 
         # Compute ensemble reward for stability
         validated_reward, individual_estimates = ensemble_reward.compute_ensemble_reward(

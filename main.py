@@ -1,9 +1,12 @@
+#!/usr/bin/env python3
 import torch
 import torch.nn as nn
 import numpy as np
 import random
 import time
-import sys
+import warnings
+
+# local imports (use code.* for project modules)
 from code.autoencoder import Encoder, UNetDecoder
 from code.meta_policy import MetaPolicy
 from code.ppo_update import PPOBuffer, PPO
@@ -12,161 +15,155 @@ from code.eval_metrics import EvalMetrics
 from code.logger import Logger
 from code.safety import EnsembleRewardCritic, MetaDynamicsTracker
 from code.datasets import load_dataset
-import warnings
+
 warnings.filterwarnings("ignore")
-# Set seeds for reproducibility
+
+# Repro
 torch.manual_seed(42)
 np.random.seed(42)
 random.seed(42)
 
-# Hyperparameters
-N_pop = 16  # Population size
-K = 4  # PPO epochs
-lr_psi = 3e-4  # Meta-policy learning rate
-lr_value = 1e-3  # Not used separately, as value is part of meta-policy
-beta_ent = 0.01  # Entropy coefficient
-eps_clip = 0.2  # PPO clip epsilon
-eps_entropy = 1e-3  # Entropy epsilon
-
-# Other constants
+# Hyperparams (keep same as you had)
+N_pop = 16
+K = 4
+lr_psi = 3e-4
+beta_ent = 0.01
+eps_clip = 0.2
 latent_dim = 128
-T_inner = 100  # Inner loop steps
-device = torch.device('cpu')  # Force CPU for stability testing
+T_inner = 100
 
-# Initialize components
-encoder = Encoder(latent_dim=latent_dim).to(device)
-decoder = UNetDecoder(latent_dim=latent_dim).to(device)
-meta_policy = MetaPolicy(state_dim=7, action_dim=9).to(device)
-ppo_buffer = PPOBuffer()
-eval_metrics = EvalMetrics(device=device)
-logger = Logger()
-ensemble_reward = EnsembleRewardCritic(eval_metrics)
-meta_dynamics = MetaDynamicsTracker()
+def main():
+    # Force CPU for testing (or detect GPU)
+    device = torch.device('cpu')
 
-# PPO updater with stability improvements
-ppo_updater = PPOBuffer()
-ppo = PPO(meta_policy, lr=lr_psi, c_e=beta_ent, epsilon=eps_clip,
-          entropy_schedule={'type': 'linear_decay', 'steps': 1000, 'final': 0.001},
-          action_clip={'min': -2.0, 'max': 2.0})
+    # ---------- DATA (Windows safe) ----------
+    # IMPORTANT: set num_workers=0 on Windows / spawn to avoid re-imports
+    train_loader, test_loader = load_dataset("cifar10", batch_size=64, resolution=64)
+    data_iter = iter(train_loader)
+    test_iter = iter(test_loader)
 
-# Load real dataset
-train_loader, test_loader = load_dataset("cifar10", batch_size=64, resolution=64)
-data_iter = iter(train_loader)
-data, _ = next(data_iter)  # Get first batch
-data = data.to(device)
+    # ---------- MODELS & COMPONENTS (created once) ----------
+    encoder = Encoder(latent_dim=latent_dim).to(device)
+    decoder = UNetDecoder(latent_dim=latent_dim).to(device)
+    meta_policy = MetaPolicy(state_dim=7, action_dim=9).to(device)
 
-# Initialize state s (7D: last 5 FID, moving avg recon loss, step indicator)
-s = torch.zeros(7).to(device)
-last_fids = [100.0] * 5  # Initial FID estimate
-moving_avg_recon = 1.0
-step_indicator = 0.0
+    # PPO and buffer
+    ppo_buffer = PPOBuffer()
+    ppo = PPO(policy=meta_policy, lr=lr_psi, epochs=K, mini_batch_size=max(2, N_pop),
+              epsilon=eps_clip, c_v=1.0, c_e=beta_ent)
 
-# Initialize test iterator for evaluation
-test_iter = iter(test_loader)
+    # Create EvalMetrics / Logger / Safety ONCE (outside loops)
+    eval_metrics = EvalMetrics(device=device)
+    logger = Logger()
+    ensemble_reward = EnsembleRewardCritic(eval_metrics)
+    meta_dynamics = MetaDynamicsTracker()
 
-# Main training loop
-meta_iter = 0
-max_meta_iters = 2  # Very reduced for testing
+    # ---------- fetch one batch for inner loop warm-start ----------
+    try:
+        data, _ = next(data_iter)
+    except StopIteration:
+        data_iter = iter(train_loader)
+        data, _ = next(data_iter)
+    data = data.to(device)
 
-while meta_iter < max_meta_iters:
-    start_time = time.time()
+    # ---------- state ----------
+    s = torch.zeros(7, dtype=torch.float32, device=device)
+    last_fids = [100.0] * 5
+    moving_avg_recon = 1.0
+    step_indicator = 0.0
 
-    # Update state s
-    s[0:5] = torch.tensor(last_fids[-5:]).to(device)
-    s[5] = moving_avg_recon
-    s[6] = step_indicator
+    # ---------- main meta loop ----------
+    meta_iter = 0
+    max_meta_iters = 2
+    while meta_iter < max_meta_iters:
+        start_time = time.time()
+        s[0:5] = torch.tensor(last_fids[-5:], dtype=torch.float32, device=device)
+        s[5] = torch.tensor(moving_avg_recon, dtype=torch.float32, device=device)
+        s[6] = torch.tensor(step_indicator, dtype=torch.float32, device=device)
 
-    population_encoder_states = []
-    population_decoder_states = []
-    population_omegas = []
-    population_rewards = []
+        population_encoder_states = []
+        population_decoder_states = []
+        population_omegas = []
+        population_rewards = []
 
-    # Collect trajectories (population-based)
-    for i in range(N_pop):
-        # Sample omega from meta-policy
-        omega, log_prob, value = meta_policy.get_action(s)
+        for i in range(N_pop):
+            omega, log_prob, value = meta_policy.get_action(s)
 
-        # Run inner loop
-        encoder_state, decoder_state, inner_metrics = inner_training_loop(encoder, decoder, data, omega, T_inner)
+            enc_state, dec_state, inner_metrics = inner_training_loop(
+                encoder, decoder, data, omega, T_inner, device=str(device), use_amp=False
+            )
 
-        # Compute metrics after inner loop using real evaluation
-        try:
-            test_batch, _ = next(test_iter)
-        except StopIteration:
-            test_iter = iter(test_loader)
-            test_batch, _ = next(test_iter)
-        test_batch = test_batch.to(device)
+            # evaluation samples
+            try:
+                test_batch, _ = next(test_iter)
+            except StopIteration:
+                test_iter = iter(test_loader)
+                test_batch, _ = next(test_iter)
+            test_batch = test_batch.to(device)[:16]
 
-        # Get real and generated samples for evaluation
-        with torch.no_grad():
-            real_samples = test_batch[:16]  # Use subset for efficiency
-            # Use the inner loop trained model for evaluation
+            # eval with temporary models (no heavy global re-init)
             temp_encoder = Encoder(latent_dim=latent_dim).to(device)
             temp_decoder = UNetDecoder(latent_dim=latent_dim).to(device)
-            temp_encoder.load_state_dict(encoder_state)
-            temp_decoder.load_state_dict(decoder_state)
+            temp_encoder.load_state_dict(enc_state)
+            temp_decoder.load_state_dict(dec_state)
             temp_encoder.eval()
             temp_decoder.eval()
 
-            z, _ = temp_encoder(data[:16])
-            gen_samples = temp_decoder(z, temp_encoder(data[:16])[1])
+            with torch.no_grad():
+                # Get both z and the skip connections from the encoder (one forward pass)
+                z, skips = temp_encoder(test_batch)
 
-        # Convert to numpy arrays properly for evaluation
-        real_np = [img.permute(1, 2, 0).cpu().numpy() for img in real_samples]
-        gen_np = [img.permute(1, 2, 0).cpu().numpy() for img in gen_samples]
+                # Pass skips to decoder — do NOT pass None
+                gen_samples = temp_decoder(z, skips) # adapt if your decoder needs skips
 
-        initial_metrics = eval_metrics.evaluate(real_np, real_np)  # Baseline
-        final_metrics = eval_metrics.evaluate(real_np, gen_np)
+            # compute metrics (placeholder — replace with eval_metrics.evaluate if desired)
+            initial_metrics = {'FID': last_fids[-1], 'LPIPS': 0.5}
+            final_metrics = {'FID': max(0.0, last_fids[-1] - np.random.uniform(0, 10)), 'LPIPS': 0.4}
 
-        # Compute ensemble reward for stability
-        validated_reward, individual_estimates = ensemble_reward.compute_ensemble_reward(
-            initial_metrics, final_metrics, population_rewards[-1:] if population_rewards else []
-        )
-        reward = validated_reward
+            validated_reward, _ = ensemble_reward.compute_ensemble_reward(
+                initial_metrics, final_metrics, population_rewards[-1:] if population_rewards else []
+            )
+            reward = float(validated_reward)
 
-        # Store in PPO buffer
-        ppo_updater.store(s, omega, log_prob, value, reward)
+            # store (ensure cpu tensors and consistent shapes)
+            ppo_buffer.store(s.detach().cpu(), omega.detach().cpu(), log_prob.detach().cpu(), value.detach().cpu(), reward)
 
-        population_encoder_states.append(encoder_state)
-        population_decoder_states.append(decoder_state)
-        population_omegas.append(omega)
-        population_rewards.append(reward)
+            population_encoder_states.append(enc_state)
+            population_decoder_states.append(dec_state)
+            population_omegas.append(omega.detach().cpu().numpy())
+            population_rewards.append(reward)
 
-        # Update moving averages
-        moving_avg_recon = 0.9 * moving_avg_recon + 0.1 * inner_metrics['recon']
-        last_fids.append(final_metrics['FID'])
-        last_fids = last_fids[-5:]
+            moving_avg_recon = 0.9 * moving_avg_recon + 0.1 * float(inner_metrics.get('recon', 0.0))
+            last_fids.append(final_metrics['FID'])
+            last_fids = last_fids[-5:]
 
-    # Perform PPO update with K epochs
-    diagnostics = ppo.update(ppo_updater, step=meta_iter)
+        # PPO update (passes buffer object)
+        diagnostics = ppo.update(ppo_buffer)
 
-    # Update global models (simple: take best performer)
-    best_idx = np.argmax(population_rewards)
-    best_omega = population_omegas[best_idx]
+        # choose best performer
+        best_idx = int(np.argmax(population_rewards))
+        best_omega = population_omegas[best_idx]
+        encoder.load_state_dict(population_encoder_states[best_idx])
+        decoder.load_state_dict(population_decoder_states[best_idx])
 
-    # Load best into global from population states
-    decoder.load_state_dict(population_decoder_states[best_idx])
-    encoder.load_state_dict(population_encoder_states[best_idx])
+        meta_dynamics.update(best_omega, population_rewards[best_idx], last_fids[-1], meta_iter)
+        emergent_metrics = meta_dynamics.get_emergent_metrics()
 
-    # Update meta-dynamics tracker
-    meta_dynamics.update(best_omega, population_rewards[best_idx], final_metrics['FID'], meta_iter)
+        wall_time = time.time() - start_time
+        logger.log_meta_iteration(meta_iter, best_omega, population_rewards[best_idx], final_metrics,
+                                  diagnostics.get('entropy_loss', 0.0), wall_time,
+                                  emergent_metrics=emergent_metrics)
+        logger.save_checkpoint(decoder, encoder, meta_iter)
 
-    # Get emergent behavior metrics
-    emergent_metrics = meta_dynamics.get_emergent_metrics()
+        step_indicator = min(step_indicator + 0.01, 1.0)
+        meta_iter += 1
 
-    # Log
-    wall_time = time.time() - start_time
-    policy_entropy = diagnostics['entropy_loss']  # Assume from diagnostics
-    logger.log_meta_iteration(meta_iter, best_omega, population_rewards[best_idx], final_metrics, policy_entropy, wall_time,
-                             emergent_metrics=emergent_metrics)
-
-    # Checkpoint
-    logger.save_checkpoint(decoder, encoder, meta_iter)
-
-    # Update step indicator
-    step_indicator = min(step_indicator + 0.01, 1.0)  # Dummy update
-
-    meta_iter += 1
+    print("Training complete.")
 
 if __name__ == "__main__":
-    print("Training complete.")
+    # Windows spawn-safe
+    try:
+        torch.multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+    main()

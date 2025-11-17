@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .losses import l_recon, l_div, kl_divergence_loss, PerceptualLoss, Discriminator, adversarial_loss
 
 
 class ResidualBlock(nn.Module):
@@ -34,9 +35,8 @@ class Encoder(nn.Module):
         self.block2 = ResidualBlock(64, 128, 2)
         self.block3 = ResidualBlock(128, 256, 2)
         self.block4 = ResidualBlock(256, 512, 2)
-        self.block5 = ResidualBlock(512, 1024, 2)
         self.flatten = nn.Flatten()
-        self.linear = nn.Linear(4096, latent_dim)
+        self.linear = nn.Linear(512 * 4, latent_dim)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -53,9 +53,8 @@ class Encoder(nn.Module):
         skip2 = self.block2(skip1)
         skip3 = self.block3(skip2)
         skip4 = self.block4(skip3)
-        skip5 = self.block5(skip4)
-        z = self.linear(self.flatten(skip5))
-        skips = [skip1, skip2, skip3, skip4, skip5]
+        z = self.linear(self.flatten(skip4))
+        skips = [skip1, skip2, skip3, skip4]
         return z, skips
 
 
@@ -63,27 +62,22 @@ class UNetDecoder(nn.Module):
     def __init__(self, latent_dim=128):
         super().__init__()
         # Initial projection from latent to feature map (start at 2x2 like encoder ends)
-        self.linear = nn.Linear(latent_dim, 1024 * 2 * 2)
+        self.linear = nn.Linear(latent_dim, 512 * 2 * 2)
 
-        # U-Net decoder matching encoder's spatial resolutions
-        # Encoder outputs: skips[4]=2x2 (1024), [3]=4x4 (512), [2]=8x8 (256), [1]=16x16 (128), [0]=32x32 (64)
+        # Simplified decoder for 32x32 output
+        self.up1 = nn.ConvTranspose2d(512, 256, 2, 2, 0)   # 2x2 -> 4x4
+        self.conv1 = nn.Conv2d(256, 256, 1, 1, 0)
 
-        self.up1 = nn.ConvTranspose2d(1024, 512, 4, 2, 1)  # 2x2 -> 4x4 (1024ch)
-        self.conv1 = nn.Conv2d(1536, 512, 3, 1, 1)  # After concat with interpolated skips[4] (512+1024=1536)
+        self.up2 = nn.ConvTranspose2d(256, 128, 2, 2, 0)   # 4x4 -> 8x8
+        self.conv2 = nn.Conv2d(128, 128, 1, 1, 0)
 
-        self.up2 = nn.ConvTranspose2d(512, 256, 4, 2, 1)   # 4x4 -> 8x8 (512ch)
-        self.conv2 = nn.Conv2d(768, 256, 3, 1, 1)   # After concat with skips[3] (256+512=768)
+        self.up3 = nn.ConvTranspose2d(128, 64, 2, 2, 0)    # 8x8 -> 16x16
+        self.conv3 = nn.Conv2d(64, 64, 1, 1, 0)
 
-        self.up3 = nn.ConvTranspose2d(256, 128, 4, 2, 1)   # 8x8 -> 16x16 (256ch)
-        self.conv3 = nn.Conv2d(384, 128, 3, 1, 1)   # After concat with skips[2] (128+256=384)
+        self.up4 = nn.ConvTranspose2d(64, 32, 2, 2, 0)     # 16x16 -> 32x32
+        self.conv4 = nn.Conv2d(32, 32, 1, 1, 0)
 
-        self.up4 = nn.ConvTranspose2d(128, 64, 4, 2, 1)    # 16x16 -> 32x32 (128ch)
-        self.conv4 = nn.Conv2d(192, 64, 3, 1, 1)    # After concat with skips[1] (64+128=192)
-
-        self.up5 = nn.ConvTranspose2d(64, 32, 4, 2, 1)     # 32x32 -> 64x64 (64ch)
-        self.conv5 = nn.Conv2d(96, 32, 3, 1, 1)     # After concat with skips[0] (32+64=96)
-
-        self.final = nn.Conv2d(32, 3, 3, 1, 1)
+        self.final = nn.Conv2d(32, 3, 1, 1, 0)
 
         self.apply(self._init_weights)
 
@@ -93,33 +87,93 @@ class UNetDecoder(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, z, skips):
-        x = self.linear(z).view(-1, 1024, 2, 2)  # Start at 2x2 like encoder
+    def forward(self, z, skips=None):
+        x = self.linear(z).view(-1, 512, 2, 2)  # Start at 2x2
 
-        # Level 1: 2x2 -> 4x4, concat with skips[4] (2x2->4x4)
-        x = F.relu(self.up1(x))  # 512x4x4
-        x = torch.cat([x, F.interpolate(skips[4], size=(4, 4), mode='bilinear', align_corners=False)], dim=1)  # 1024+512=1536x4x4
-        x = F.relu(self.conv1(x))  # 512x4x4
+        x = F.relu(self.up1(x))
+        x = F.relu(self.conv1(x))
 
-        # Level 2: 4x4 -> 8x8, concat with skips[3] (4x4->8x8)
-        x = F.relu(self.up2(x))  # 256x8x8
-        x = torch.cat([x, F.interpolate(skips[3], size=(8, 8), mode='bilinear', align_corners=False)], dim=1)  # 768x8x8
-        x = F.relu(self.conv2(x))  # 256x8x8
+        x = F.relu(self.up2(x))
+        x = F.relu(self.conv2(x))
 
-        # Level 3: 8x8 -> 16x16, concat with skips[2] (8x8->16x16)
-        x = F.relu(self.up3(x))  # 128x16x16
-        x = torch.cat([x, F.interpolate(skips[2], size=(16, 16), mode='bilinear', align_corners=False)], dim=1)  # 384x16x16
-        x = F.relu(self.conv3(x))  # 128x16x16
+        x = F.relu(self.up3(x))
+        x = F.relu(self.conv3(x))
 
-        # Level 4: 16x16 -> 32x32, concat with skips[1] (16x16->32x32)
-        x = F.relu(self.up4(x))  # 64x32x32
-        x = torch.cat([x, F.interpolate(skips[1], size=(32, 32), mode='bilinear', align_corners=False)], dim=1)  # 192x32x32
-        x = F.relu(self.conv4(x))  # 64x32x32
+        x = F.relu(self.up4(x))
+        x = F.relu(self.conv4(x))
 
-        # Level 5: 32x32 -> 64x64, concat with skips[0] (32x32->64x64)
-        x = F.relu(self.up5(x))  # 32x64x64
-        x = torch.cat([x, F.interpolate(skips[0], size=(64, 64), mode='bilinear', align_corners=False)], dim=1)  # 96x64x64
-        x = F.relu(self.conv5(x))  # 32x64x64
-
-        x = self.final(x)  # 3x64x64
+        x = self.final(x)
         return torch.tanh(x)
+
+
+class Autoencoder(nn.Module):
+    def __init__(self, latent_dim=128):
+        super().__init__()
+        self.encoder = Encoder(latent_dim)
+        self.decoder = UNetDecoder(latent_dim)
+        self.perceptual_loss = PerceptualLoss()
+        self.discriminator = Discriminator()
+
+    def encode(self, x):
+        z, _ = self.encoder(x)
+        return z
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        z, skips = self.encoder(x)
+        x_hat = self.decoder(z)
+        return x_hat, z
+
+    def compute_losses(self, x, x_hat, z, omega_dict):
+        """
+        Compute the composite loss using omega_dict weights.
+
+        Args:
+            x: Original input
+            x_hat: Reconstructed output
+            z: Latent representation
+            omega_dict: Dictionary with loss weights and gates
+
+        Returns:
+            dict: Individual losses and total loss
+        """
+        losses = {}
+
+        # Reconstruction loss
+        losses['L_rec'] = l_recon(x, x_hat)
+
+        # Adversarial loss (only if gate is active)
+        if 'g_adv' in omega_dict and omega_dict['g_adv'] > 0.5:
+            _, g_loss = adversarial_loss(self.discriminator, x, x_hat)
+            losses['L_adv'] = g_loss
+        else:
+            losses['L_adv'] = torch.tensor(0.0, device=x.device)
+
+        # Diversity loss
+        losses['L_div'] = l_div(z)
+
+        # Perceptual loss
+        losses['L_perc'] = self.perceptual_loss(x, x_hat)
+
+        # KL divergence loss
+        losses['L_KL'] = kl_divergence_loss(z)
+
+        # Compute total loss
+        total_loss = 0.0
+        if 'alpha_rec' in omega_dict:
+            total_loss += omega_dict['alpha_rec'] * losses['L_rec']
+        if 'alpha_adv' in omega_dict and 'g_adv' in omega_dict:
+            total_loss += omega_dict['alpha_adv'] * omega_dict['g_adv'] * losses['L_adv']
+        elif 'alpha_adv' in omega_dict:
+            total_loss += omega_dict['alpha_adv'] * losses['L_adv']
+        if 'alpha_div' in omega_dict:
+            total_loss += omega_dict['alpha_div'] * losses['L_div']
+        if 'alpha_perc' in omega_dict:
+            total_loss += omega_dict['alpha_perc'] * losses['L_perc']
+        if 'alpha_KL' in omega_dict:
+            total_loss += omega_dict['alpha_KL'] * losses['L_KL']
+
+        losses['L_total'] = total_loss
+        return losses

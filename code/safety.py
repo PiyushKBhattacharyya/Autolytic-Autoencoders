@@ -98,11 +98,14 @@ class EnsembleRewardCritic:
         return lpips_init - lpips_final  # Positive if improved
 
     def _mini_batch_avg_reward(self, batch_rewards: List[float]) -> float:
-        """Mini-batch average reward"""
-        return np.mean(batch_rewards) if batch_rewards else 0.0
+        """Mini-batch average reward - uses recent population rewards as baseline"""
+        if not batch_rewards:
+            return 0.0
+        # For autolytic systems, use the mean of recent rewards as the baseline
+        return np.mean(batch_rewards)
 
     def compute_ensemble_reward(self, initial_metrics: Dict, final_metrics: Dict,
-                               batch_rewards: Optional[List[float]] = None) -> Tuple[float, List[float]]:
+                                batch_rewards: Optional[List[float]] = None) -> Tuple[float, List[float]]:
         """
         Compute ensemble reward and individual estimates
         Returns: (validated_reward, individual_estimates)
@@ -115,8 +118,19 @@ class EnsembleRewardCritic:
         else:
             estimates.append(0.0)  # No batch rewards available
 
-        # Validate reward (simple average, could be weighted)
-        validated_reward = np.mean(estimates)
+        # Validate reward using variance-based weighting (lower variance = higher weight)
+        if len(estimates) > 1:
+            mean_est = np.mean(estimates)
+            if mean_est != 0:
+                variances = [(est - mean_est)**2 for est in estimates]
+                weights = [1.0 / (var + 1e-8) for var in variances]  # Inverse variance weighting
+                weights = np.array(weights) / np.sum(weights)  # Normalize
+                validated_reward = np.sum(weights * estimates)
+            else:
+                validated_reward = np.mean(estimates)
+        else:
+            validated_reward = np.mean(estimates)
+
         return validated_reward, estimates
 
 class RollbackMechanism:

@@ -2,8 +2,7 @@
 
 ## Overview
 
-The Autotelic Autoencoder (AAE) is a generative model in which the training objective itself is learned using a population-based reinforcement learning (RL) meta-controller. Instead of static loss terms (e.g., L1 + adversarial + perceptual), the AAE uses PPO to evolve dynamic objective functions that adjust loss weights, learning rates, schedule timing, and adversarial gating.
-This creates a self-directing system that adaptively restructures its own loss landscape to maximize generative performance (e.g., FID reduction).
+The Autotelic Autoencoder (AAE) embodies the core principle that 'the system self-evaluates and adapts its own loss to get better according to its own metrics.' This autotelic formulation, while valid and capturing the essence of self-directed learning, distinguishes itself from 'explicit goal vector in latent space' approaches by evolving objectives through a population-based reinforcement learning (RL) meta-controller. Instead of static loss terms (e.g., L1 + adversarial + perceptual), the AAE uses PPO to dynamically adjust loss weights, learning rates, scheduling, and adversarial gating, creating a self-directing system that restructures its loss landscape to maximize generative performance (e.g., FID reduction).
 
 The architecture cleanly separates:
 
@@ -100,7 +99,7 @@ s ∈ ℝ^7
 ```
 This gives high exploration and tunable objective generation.
 
-## 4. Strategy 2: Evolutionary/RL Meta-Controller Process
+## 4. Evolutionary/RL Meta-Controller Process
 
 ### Per Meta-Iteration (m)
 

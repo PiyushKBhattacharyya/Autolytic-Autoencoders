@@ -10,12 +10,11 @@ def preprocess_omega(omega: torch.Tensor, T_inner: int):
     with torch.no_grad():
         alpha_logits = omega[:5]
         sp = F.softplus(alpha_logits)
-        sp = torch.clamp(sp, min=1e-6)
         alphas = sp / (sp.sum() + 1e-8)
         g_adv = float(torch.sigmoid(omega[5]).item())
-        rho_theta = float(F.softplus(omega[6]).clamp(min=1e-3, max=10.0).item())
-        rho_phi = float(F.softplus(omega[7]).clamp(min=1e-3, max=10.0).item())
-        t_start = int((torch.sigmoid(omega[8]).item()) * max(1, int(T_inner)))
+        rho_theta = float(torch.exp(omega[6]).item())
+        rho_phi = float(torch.exp(omega[7]).item())
+        t_start = int(round(torch.sigmoid(omega[8]).item() * T_inner))
     return alphas, g_adv, rho_theta, rho_phi, t_start
 
 
@@ -111,7 +110,7 @@ def inner_training_loop(
             l_div_loss = l_div(z)
 
             # perceptual (use external function if provided)
-            if (perceptual_fn is not None) and (float(alphas[1]) > 0.0):
+            if (perceptual_fn is not None) and (float(alphas[3]) > 0.0):
                 try:
                     # perceptual_fn typically expects normalized images in [-1,1] or [0,1] depending on your setup
                     l_perc_loss = perceptual_fn(data, x_hat)
@@ -121,7 +120,7 @@ def inner_training_loop(
                 l_perc_loss = torch.tensor(0.0, device=device)
 
             # adversarial (only if discriminator passed and gate & step conditions satisfied)
-            if (discriminator is not None) and (float(alphas[2]) > 0.0) and (step >= t_start) and (g_adv > 0.0):
+            if (discriminator is not None) and (float(alphas[1]) > 0.0) and (step >= t_start) and (g_adv > 0.5):
                 try:
                     d_loss, g_loss = adversarial_loss(discriminator, data, x_hat)
                     l_adv_loss = g_loss
@@ -131,7 +130,7 @@ def inner_training_loop(
                 l_adv_loss = torch.tensor(0.0, device=device)
 
             # KL (if applicable)
-            if float(alphas[3]) > 0.0:
+            if float(alphas[4]) > 0.0:
                 try:
                     l_kl_loss = kl_divergence_loss(z)
                 except Exception:
@@ -139,8 +138,11 @@ def inner_training_loop(
             else:
                 l_kl_loss = torch.tensor(0.0, device=device)
 
-            primitive_losses = [l_recon_loss, l_perc_loss, l_adv_loss, l_kl_loss, l_div_loss]
-            L_base = sum((alpha * loss) for alpha, loss in zip(alphas, primitive_losses))
+            primitive_losses = [l_recon_loss, l_adv_loss, l_div_loss, l_perc_loss, l_kl_loss]
+            effective_alphas = alphas.clone()
+            effective_alphas[1] *= g_adv  # apply g_adv multiplier to α_adv
+            L_base = sum((effective_alpha * loss) for effective_alpha, loss in zip(effective_alphas, primitive_losses))
+            L_base = L_base.mean()  # Ensure scalar output for backward()
 
         # Update discriminator first (if available)
         if (discriminator is not None) and ('d_loss' in locals()) and (step >= t_start):

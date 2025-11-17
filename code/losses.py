@@ -52,20 +52,30 @@ def l_div(z, delta_cov=1e-6, epsilon_num=1e-12):
 class PerceptualLoss(nn.Module):
     def __init__(self, device='cuda'):
         super().__init__()
-        # Use LPIPS for perceptual loss
-        try:
-            self.lpips = lpips.LPIPS(net='vgg').to(device)
-            self.available = True
-        except:
-            self.available = False
-            self.lpips = None
+        # Load pre-trained VGG16 for perceptual loss
+        vgg = models.vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features.to(device)
+        self.vgg_layers = nn.Sequential(*list(vgg.children())[:16])  # Up to conv3_3
+        self.vgg_layers.eval()
+        for param in self.vgg_layers.parameters():
+            param.requires_grad = False
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def normalize(self, x):
+        return (x - self.mean) / self.std
 
     def forward(self, x, y):
-        if self.available:
-            return self.lpips(x, y).mean()
-        else:
-            # Fallback to L1 if LPIPS not available
-            return F.l1_loss(x, y)
+        # Normalize inputs (assuming x, y are in [-1, 1], convert to [0, 1] then normalize)
+        x_norm = self.normalize((x + 1) / 2)
+        y_norm = self.normalize((y + 1) / 2)
+
+        # Extract VGG features
+        feat_x = self.vgg_layers(x_norm)
+        feat_y = self.vgg_layers(y_norm)
+
+        # Compute LPIPS-like distance: L2 distance on normalized features
+        diff = (feat_x - feat_y).pow(2).mean(dim=[2, 3])  # Spatial mean
+        return diff.mean()  # Overall mean
 
 
 class Discriminator(nn.Module):

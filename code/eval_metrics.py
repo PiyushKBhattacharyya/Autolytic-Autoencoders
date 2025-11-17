@@ -57,14 +57,20 @@ class EvalMetrics:
         GPU → Extract Inception features
         CPU → Extract simple statistical 2048D feature (SPEED-FID)
         """
-        
+
         # GPU MODE: True FID via Inception-V3
         if not self.use_fast_fid:
             feats = []
             with torch.no_grad():
                 for img in images:
-                    if not isinstance(img, torch.Tensor):
-                        img = self.transform(img)
+                    if isinstance(img, np.ndarray):
+                        img = torch.from_numpy(img).permute(2, 0, 1).float()  # HWC to CHW, assume [0,1]
+                    # Resize to 299x299 for Inception
+                    img = torch.nn.functional.interpolate(img.unsqueeze(0), size=(299, 299), mode='bilinear', align_corners=False).squeeze(0)
+                    # Normalize
+                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                    img = (img - mean) / std
                     img = img.unsqueeze(0).to(self.device)
                     out = self.inception(img)
                     feats.append(out.cpu().numpy().reshape(-1))
